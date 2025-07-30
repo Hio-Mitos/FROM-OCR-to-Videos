@@ -1,16 +1,17 @@
 import os
 import pandas as pd
-from paddleocr import PaddleOCR
+from easyocr import Reader
 from tkinter import filedialog, Tk
 from tqdm import tqdm
 from langdetect import detect
 import language_tool_python
-import paddle
 
 # === HELPER FUNCTIONS ===
+
 def select_base_folder():
     Tk().withdraw()
     return filedialog.askdirectory(title="Select Base Folder with Chapters")
+
 
 def select_output_csv():
     Tk().withdraw()
@@ -21,25 +22,24 @@ def select_output_csv():
         initialfile="all_chapters_text.csv"
     )
 
-# === INIT PADDLE DEVICE & OCR ===
-device = 'gpu' if paddle.is_compiled_with_cuda() else 'cpu'
-paddle.set_device(device)
-ocr = PaddleOCR(use_textline_orientation=True, 
-                lang='en',
-                # text_det_limit_side_len=12000,    # raise detection resize limit
-                # det_max_side_len=12000,     # same for recognition
-                text_det_box_thresh=0.3,      # default 0.3  (raise to merge nearby boxes)
-                text_det_unclip_ratio=2.2    # default 1.5 (raise to enlarge each detection)
-                )  # no `use_gpu` arg needed
-print(f"PaddleOCR initialized on device: {device}")
+# === SUPPRESS PIN_MEMORY WARNINGS ===
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="'pin_memory' argument is set as true but no accelerator is found",
+    category=UserWarning
+)
+
+# === INIT EASYOCR READER ON GPU/CPU ===
+# If CUDA is available, EasyOCR will use GPU; otherwise falls back to CPU.
+reader = Reader(['en'], gpu=True)
+print(f"EasyOCR initialized on device: {reader.device}")
+
 
 # === INIT LANGUAGE TOOL ===
-tools_by_lang = {
-    'en': language_tool_python.LanguageTool('en-US'),
-    # add more languages as needed
-}
+tools_by_lang = {'en': language_tool_python.LanguageTool('en-US')}
 
-# === SLANG MAPPING ===
+# === SLANG MAP ===
 slang_map = {
     "gonna": "going to", "wanna": "want to", "gotta": "got to",
     "ain't": "is not", "lemme": "let me", "kinda": "kind of",
@@ -70,40 +70,23 @@ for chapter in tqdm(chapters, desc="Chapters"):
     for filename in tqdm(images, desc=chapter, leave=False):
         file_path = os.path.join(chapter_path, filename)
         try:
-            result = ocr.ocr(file_path)           # returns [[detections], ...]
-            detections = result[0] if result else []
-
-            # Text always lives in detections[i][1]:
-            raw_lines = []
-            for det in detections:
-                text_item = det[1]
-                # If PaddleOCR packs (text,score) tuple, grab .[0]
-                if isinstance(text_item, (list, tuple)):
-                    raw_lines.append(text_item[0])
-                else:
-                    raw_lines.append(str(text_item))
-
-            raw_text = "\n".join(raw_lines).strip()
+            # detail=1 returns (bbox, text, confidence), paragraph=True merges lines
+            results = reader.readtext(file_path, detail=1, paragraph=True)
+            raw_text = "\n".join([res[1] for res in results]).strip()
 
             if raw_text:
                 lang = detect(raw_text)
                 tool = tools_by_lang.get(lang)
                 corrected = tool.correct(raw_text) if tool else raw_text
-                # Apply slang replacements
                 for slang, formal in slang_map.items():
                     corrected = corrected.replace(slang, formal)
             else:
                 corrected = ""
-
         except Exception as e:
             print(f"[Error] Skipped {file_path}: {e}")
             corrected = ""
 
-        data.append({
-            'Chapter': chapter,
-            'Filename': filename,
-            'ExtractedText': corrected
-        })
+        data.append({'Chapter': chapter, 'Filename': filename, 'ExtractedText': corrected})
 
 # === SAVE OUTPUT ===
 df = pd.DataFrame(data)
